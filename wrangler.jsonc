@@ -4,7 +4,7 @@
  */
 {
     "$schema": "node_modules/wrangler/config-schema.json",
-    "name": "gemini-proxy",
+    "name": "gemini-reverse-proxy-worker",
     "main": "src/index.ts",
     "compatibility_date": "2025-11-15",
     "assets": {
@@ -16,8 +16,8 @@
     },
     "kv_namespaces": [
         {
-            "binding": "KV_STORAGE",
-            "id": "9caf3cd56907481b8a61fa05e7920894",
+             "binding": "KV_STORAGE",
+             "id": "87bca48896d54239a947122ccbcd4015",
         },
     ],
     /**
