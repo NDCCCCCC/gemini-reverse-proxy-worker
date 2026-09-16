@@ -87,7 +87,15 @@ app.all("/*", async (c) => {
     let path = c.req.path;
     const url = new URL(c.req.url);
     const headers = new Headers(c.req.raw.headers);
-    const clientKey = headers.get("x-goog-api-key");
+    // Client key: x-goog-api-key first, then fall back to Authorization Bearer
+    // (the OpenAI SDK sends its api_key as a Bearer token)
+    let clientKey = headers.get("x-goog-api-key");
+    if (!clientKey) {
+        const authorization = headers.get("authorization");
+        if (authorization?.startsWith("Bearer ")) {
+            clientKey = authorization.slice(7).trim();
+        }
+    }
     if (!clientKey) {
         return c.json({ error: "Missing API key" }, 400);
     }
@@ -141,6 +149,15 @@ app.all("/*", async (c) => {
                 }),
             );
             headers.set(authHeader[0], authHeader[1]);
+            if (typeof keyConfig.key === "string") {
+                if (path.includes("/openai/")) {
+                    // The OpenAI compatibility layer only accepts Bearer auth
+                    headers.set("authorization", `Bearer ${keyConfig.key}`);
+                } else {
+                    // Native endpoints: strip the client JWT before forwarding
+                    headers.delete("authorization");
+                }
+            }
 
             const response = await fetch(targetUrl.toString(), {
                 method: c.req.method,
