@@ -119,6 +119,37 @@ app.all("/*", async (c) => {
         }
     }
 
+    // Google's OpenAI-compat layer rejects unknown/unsupported fields with a
+    // 400 instead of ignoring them. Common OpenAI clients (e.g. SillyTavern)
+    // always send several of those, so strip the known-bad ones upfront.
+    let openaiBody: Record<string, unknown> | null = null;
+    let openaiBodyStr: string | null = null;
+    let openaiRawBody: ArrayBuffer | null = null;
+    if (path.includes("/openai/") && c.req.method === "POST") {
+        openaiRawBody = await c.req.arrayBuffer();
+        try {
+            const parsed = JSON.parse(
+                new TextDecoder().decode(openaiRawBody),
+            ) as Record<string, unknown>;
+            for (const field of [
+                "frequency_penalty",
+                "logit_bias",
+                "seed",
+                "logprobs",
+                "top_logprobs",
+            ]) {
+                delete parsed[field];
+            }
+            if (Array.isArray(parsed.stop) && parsed.stop.length === 0) {
+                delete parsed.stop; // empty stop arrays are rejected upstream
+            }
+            openaiBody = parsed;
+            openaiBodyStr = JSON.stringify(parsed);
+        } catch {
+            // Not JSON — forward the original bytes untouched
+        }
+    }
+
     // Try each key until one succeeds
     let lastError: Error | null = null;
 
@@ -159,31 +190,54 @@ app.all("/*", async (c) => {
                 }
             }
 
-            const response = await fetch(targetUrl.toString(), {
-                method: c.req.method,
-                headers,
-                body:
-                    c.req.method !== "GET" && c.req.method !== "HEAD"
-                        ? c.req.raw.body
-                        : undefined,
-            });
-
-            // If successful, return the response
-            if (response.ok || response.status < 500) {
-                // Return response with same headers
-                const responseHeaders = new Headers(response.headers);
-                responseHeaders.set("Access-Control-Allow-Origin", "*");
-
-                return new Response(response.body, {
-                    status: response.status,
-                    statusText: response.statusText,
-                    headers: responseHeaders,
+            // Google names the offending field in 400 responses ("Unknown
+            // name \"x\": Cannot find field.") — drop it and retry the same
+            // key so exotic clients still work without a field blacklist.
+            for (let attempt = 0; ; attempt++) {
+                const response = await fetch(targetUrl.toString(), {
+                    method: c.req.method,
+                    headers,
+                    body:
+                        c.req.method !== "GET" && c.req.method !== "HEAD"
+                            ? (openaiBodyStr ?? openaiRawBody ?? c.req.raw.body)
+                            : undefined,
                 });
-            }
 
-            lastError = new Error(
-                `HTTP ${response.status}: ${response.statusText}`,
-            );
+                if (
+                    response.status === 400 &&
+                    openaiBody !== null &&
+                    attempt < 8
+                ) {
+                    const probe = await response
+                        .clone()
+                        .text()
+                        .catch(() => "");
+                    const match = probe.match(/Unknown name "([^"]+)":/);
+                    if (match && match[1] in openaiBody) {
+                        delete openaiBody[match[1]];
+                        openaiBodyStr = JSON.stringify(openaiBody);
+                        continue;
+                    }
+                }
+
+                // If successful, return the response
+                if (response.ok || response.status < 500) {
+                    // Return response with same headers
+                    const responseHeaders = new Headers(response.headers);
+                    responseHeaders.set("Access-Control-Allow-Origin", "*");
+
+                    return new Response(response.body, {
+                        status: response.status,
+                        statusText: response.statusText,
+                        headers: responseHeaders,
+                    });
+                }
+
+                lastError = new Error(
+                    `HTTP ${response.status}: ${response.statusText}`,
+                );
+                break;
+            }
         } catch (error) {
             lastError = error as Error;
             continue;
