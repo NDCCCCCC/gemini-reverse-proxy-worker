@@ -9,7 +9,7 @@ const c = new GoogleGenAI({
 
 (async () => {
     const response = await c.models.generateContent({
-        model: "gemini-2.5-flash-lite",
+        model: "gemini-3.8-flash",
         contents: ["hi"],
     });
     console.log(JSON.stringify(response, null, 2));

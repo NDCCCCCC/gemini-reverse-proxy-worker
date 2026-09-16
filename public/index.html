@@ -178,7 +178,7 @@ const client = new GoogleGenAI({
 
 (async () => {
     const response = await client.models.generateContent({
-        model: "gemini-2.5-pro",
+        model: "gemini-3.8-flash",
         contents: ["hi"],
     });
     console.log(JSON.stringify(response, null, 2));

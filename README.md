@@ -195,7 +195,7 @@ const ai = new GoogleGenAI({
 });
 
 const response = await ai.models.generateContent({
-    model: "gemini-2.5-flash-lite",
+    model: "gemini-3.8-flash",
     contents: ["hi"],
 });
 ```
