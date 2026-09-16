@@ -76,12 +76,6 @@ async function getAuthHeader(
     }
 }
 
-// TEMPORARY DEBUG — read the last captured /openai/ 400 diagnostics. Remove after debugging.
-app.get("/_debug400", async (c) => {
-    const val = await c.env.KV_STORAGE.get("debug:last400", "json");
-    return c.json(val ?? { note: "no data captured yet" });
-});
-
 // Proxy all requests to Gemini API
 app.all("/*", async (c) => {
     const config = await parseConfig(c.env);
@@ -219,33 +213,6 @@ app.all("/*", async (c) => {
                         .clone()
                         .text()
                         .catch(() => "");
-                    // TEMPORARY DEBUG — capture diagnostics for /openai/ 400s. Remove after debugging.
-                    try {
-                        await c.env.KV_STORAGE.put(
-                            "debug:last400",
-                            JSON.stringify({
-                                time: new Date().toISOString(),
-                                upstreamError: probe.slice(0, 900),
-                                bodyKeys: Object.keys(openaiBody),
-                                bodyTypes: Object.fromEntries(
-                                    Object.entries(openaiBody).map(
-                                        ([k, v]) =>
-                                            [
-                                                k,
-                                                Array.isArray(v)
-                                                    ? "array"
-                                                    : typeof v,
-                                            ] as const,
-                                    ),
-                                ),
-                                model: openaiBody.model ?? null,
-                                attempt,
-                                keyIndex: keyConfigs.indexOf(keyConfig),
-                            }),
-                        );
-                    } catch {
-                        // debugging only — ignore storage failures
-                    }
                     const match = probe.match(/Unknown name "([^"]+)":/);
                     if (match && match[1] in openaiBody) {
                         delete openaiBody[match[1]];
