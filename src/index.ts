@@ -139,6 +139,7 @@ app.all("/*", async (c) => {
             ) as Record<string, unknown>;
             for (const field of [
                 "frequency_penalty",
+                "presence_penalty",
                 "logit_bias",
                 "seed",
                 "logprobs",
@@ -250,6 +251,24 @@ app.all("/*", async (c) => {
                         delete openaiBody[match[1]];
                         openaiBodyStr = JSON.stringify(openaiBody);
                         continue;
+                    }
+                    // Some models reject penalties with a semantic error
+                    // instead of an unknown-field error — drop them and retry.
+                    if (/Penalty is not enabled/i.test(probe)) {
+                        let removed = false;
+                        for (const field of [
+                            "presence_penalty",
+                            "frequency_penalty",
+                        ]) {
+                            if (field in openaiBody) {
+                                delete openaiBody[field];
+                                removed = true;
+                            }
+                        }
+                        if (removed) {
+                            openaiBodyStr = JSON.stringify(openaiBody);
+                            continue;
+                        }
                     }
                 }
 
