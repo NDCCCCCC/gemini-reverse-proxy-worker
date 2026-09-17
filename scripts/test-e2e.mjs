@@ -87,6 +87,32 @@ const mockServer = createServer((req, res) => {
     req.on("end", () => {
         const body = JSON.parse(raw);
         lastForwarded = body;
+        // Mirrors Google's "Unknown name" rejection, wrapped in an array like
+        // the real upstream so the retry probe is exercised end to end.
+        if (body.store !== undefined) {
+            return sendJson(res, 400, [
+                {
+                    error: {
+                        code: 400,
+                        message:
+                            'Invalid JSON payload received. Unknown name "store": Cannot find field.',
+                        status: "INVALID_ARGUMENT",
+                        details: [
+                            {
+                                "@type":
+                                    "type.googleapis.com/google.rpc.BadRequest",
+                                fieldViolations: [
+                                    {
+                                        description:
+                                            'Invalid JSON payload received. Unknown name "store": Cannot find field.',
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                },
+            ]);
+        }
         if (hasUnsignedToolCall(body.messages)) {
             return sendJson(res, 400, [
                 {
@@ -372,6 +398,26 @@ try {
     );
     assert.equal(lastForwarded.messages[1].tool_calls.length, 1);
     console.log("T5 pass: signed history passes through untouched");
+
+    // T6: Google-style "Unknown name" errors strip the offending field and
+    // retry — `store` was historically rejected and the JSON-escaping on the
+    // wire broke the old regex entirely.
+    const t6 = await chat({
+        model: "m",
+        messages: [{ role: "user", content: "hi" }],
+        store: false,
+    });
+    assert.equal(
+        t6.status,
+        200,
+        `expected retry 200, got ${t6.status}: ${t6.text.slice(0, 200)}`,
+    );
+    assert.equal(
+        "store" in lastForwarded,
+        false,
+        `store must be stripped, lastForwarded keys: ${Object.keys(lastForwarded).join(",")}`,
+    );
+    console.log("T6 pass: unknown-field retry strips store and succeeds");
 
     console.log("\nALL E2E TESTS PASSED");
 } finally {

@@ -67,6 +67,57 @@ function unwrapGoogleErrorBody(text: string): string | null {
     return null;
 }
 
+/**
+ * Extract the human-readable complaint strings from Google's error bodies.
+ * Handles the array-wrapped shape and the native object shape; pulls both
+ * `error.message` and the per-field descriptions under `details[].fieldViolations`.
+ * Returns the joined text, or the raw text if it's not JSON.
+ */
+function extractGoogleErrorMessage(text: string): string {
+    try {
+        const parsed: unknown = JSON.parse(text);
+        const objects: unknown[] = [];
+        if (Array.isArray(parsed)) {
+            for (const item of parsed)
+                if (typeof item === "object" && item !== null)
+                    objects.push(item);
+        } else if (typeof parsed === "object" && parsed !== null) {
+            objects.push(parsed);
+        }
+        const parts: string[] = [];
+        for (const object of objects) {
+            const err = (object as Record<string, unknown>).error;
+            if (typeof err !== "object" || err === null) continue;
+            const record = err as Record<string, unknown>;
+            if (typeof record.message === "string") parts.push(record.message);
+            if (Array.isArray(record.details)) {
+                for (const detail of record.details) {
+                    if (typeof detail !== "object" || detail === null) continue;
+                    const violations = (detail as Record<string, unknown>)
+                        .fieldViolations;
+                    if (!Array.isArray(violations)) continue;
+                    for (const violation of violations) {
+                        if (
+                            typeof violation === "object" &&
+                            violation !== null &&
+                            typeof (violation as Record<string, unknown>)
+                                .description === "string"
+                        ) {
+                            parts.push(
+                                (violation as Record<string, unknown>)
+                                    .description as string,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        return parts.join("\n") || text;
+    } catch {
+        return text;
+    }
+}
+
 // Enable CORS for all routes
 app.use("/*", cors());
 
@@ -197,6 +248,7 @@ app.all("/*", async (c) => {
                 "seed",
                 "logprobs",
                 "top_logprobs",
+                "store",
             ]) {
                 delete parsed[field];
             }
@@ -276,11 +328,17 @@ app.all("/*", async (c) => {
                     openaiBody !== null &&
                     attempt < 8
                 ) {
-                    const probe = await response
+                    const rawProbe = await response
                         .clone()
                         .text()
                         .catch(() => "");
-                    const match = probe.match(/Unknown name "([^"]+)":/);
+                    // Google's error messages contain JSON-escaped quotes on the
+                    // wire, so probe the *parsed* message string — matching the
+                    // raw bytes (as the previous regex did) silently misses
+                    // every "Unknown name" complaint because the quote after
+                    // "name " is preceded by a backslash.
+                    const messageProbe = extractGoogleErrorMessage(rawProbe);
+                    const match = messageProbe.match(/Unknown name "([^"]+)":/);
                     if (match && match[1] in openaiBody) {
                         delete openaiBody[match[1]];
                         openaiBodyStr = JSON.stringify(openaiBody);
@@ -288,7 +346,10 @@ app.all("/*", async (c) => {
                     }
                     // Some models reject penalties with a semantic error
                     // instead of an unknown-field error — drop them and retry.
-                    if (/Penalty is not enabled/i.test(probe)) {
+                    if (
+                        /Penalty is not enabled/i.test(messageProbe) ||
+                        /Penalty is not enabled/i.test(rawProbe)
+                    ) {
                         let removed = false;
                         for (const field of [
                             "presence_penalty",
