@@ -5,7 +5,9 @@
         "dev": "wrangler dev",
         "deploy": "wrangler deploy --minify",
         "cf-typegen": "wrangler types --env-interface CloudflareBindings",
-        "format": "prettier --write ."
+        "format": "prettier --write .",
+        "test": "node --experimental-strip-types --test scripts/test-thought-signature.ts",
+        "test:e2e": "node scripts/test-e2e.mjs"
     },
     "dependencies": {
         "hono": "^4.10.6"

@@ -1,12 +1,71 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { parseConfig, updateConfig } from "./config";
 import { getStorage } from "./storage";
+import {
+    backfillThoughtSignatures,
+    createStreamWatcher,
+    harvestPairs,
+    pumpSse,
+    SignatureCache,
+} from "./thought-signature";
 import type { Credential } from "./types";
 import { hashKey, validateClientKey } from "./utils";
 import { getAccessToken, rewritePathForVertexAI } from "./vertexai";
 
 const app = new Hono<{ Bindings: CloudflareBindings }>();
+
+// Signature caches live across requests so the in-memory layer actually hits
+// between the tool-call response and the follow-up request in the same isolate.
+const signatureCaches = new WeakMap<KVNamespace, SignatureCache>();
+let memoryOnlyCache: SignatureCache | undefined;
+function signatureCache(env: CloudflareBindings): SignatureCache {
+    const kv = env.KV_STORAGE;
+    if (!kv) return (memoryOnlyCache ??= new SignatureCache(undefined));
+    let cache = signatureCaches.get(kv);
+    if (!cache) {
+        cache = new SignatureCache(kv);
+        signatureCaches.set(kv, cache);
+    }
+    return cache;
+}
+
+/** waitUntil when an execution context exists; fire-and-forget otherwise. */
+function defer(c: Context, promise: Promise<unknown>): void {
+    let executionCtx: { waitUntil(promise: Promise<unknown>): void };
+    try {
+        executionCtx = c.executionCtx;
+    } catch {
+        executionCtx = {
+            waitUntil: (promise) => promise.catch(() => {}),
+        };
+    }
+    executionCtx.waitUntil(promise);
+}
+
+/**
+ * Google's OpenAI-compatibility layer wraps error bodies in an array
+ * ([{"error":{...}}]) instead of the standard object shape, so OpenAI SDKs
+ * can't read them ("400 status code (no body)"). Unwrap to the standard
+ * object; anything else passes through untouched.
+ */
+function unwrapGoogleErrorBody(text: string): string | null {
+    try {
+        const parsed: unknown = JSON.parse(text);
+        if (
+            Array.isArray(parsed) &&
+            parsed.length > 0 &&
+            typeof parsed[0] === "object" &&
+            parsed[0] !== null &&
+            "error" in parsed[0]
+        ) {
+            return JSON.stringify(parsed[0]);
+        }
+    } catch {
+        // not JSON — leave it alone
+    }
+    return null;
+}
 
 // Enable CORS for all routes
 app.use("/*", cors());
@@ -145,6 +204,14 @@ app.all("/*", async (c) => {
                 delete parsed.stop; // empty stop arrays are rejected upstream
             }
             openaiBody = parsed;
+            // Heal missing thought signatures before forwarding (Gemini 3.x
+            // rejects any history whose function calls travel without one).
+            if (Array.isArray(parsed.messages)) {
+                await backfillThoughtSignatures(
+                    parsed.messages,
+                    signatureCache(c.env),
+                );
+            }
             openaiBodyStr = JSON.stringify(parsed);
         } catch {
             // Not JSON — forward the original bytes untouched
@@ -244,12 +311,113 @@ app.all("/*", async (c) => {
                     // Return response with same headers
                     const responseHeaders = new Headers(response.headers);
                     responseHeaders.set("Access-Control-Allow-Origin", "*");
+                    const passthrough = () =>
+                        new Response(response.body, {
+                            status: response.status,
+                            statusText: response.statusText,
+                            headers: responseHeaders,
+                        });
 
-                    return new Response(response.body, {
-                        status: response.status,
-                        statusText: response.statusText,
-                        headers: responseHeaders,
-                    });
+                    if (path.includes("/openai/")) {
+                        const contentType =
+                            responseHeaders.get("content-type") ?? "";
+                        const isChatCompletions =
+                            c.req.method === "POST" &&
+                            path.includes("/chat/completions");
+
+                        // Streaming completion: tee the body — the client
+                        // branch streams untouched while a bypass branch
+                        // harvests thought signatures into the cache.
+                        if (
+                            isChatCompletions &&
+                            response.ok &&
+                            contentType.includes("text/event-stream") &&
+                            response.body
+                        ) {
+                            const [client, bypass] = response.body.tee();
+                            const watcher = createStreamWatcher(
+                                signatureCache(c.env),
+                            );
+                            defer(
+                                c,
+                                pumpSse(bypass, watcher).then(() =>
+                                    watcher.done(),
+                                ),
+                            );
+                            return new Response(client, {
+                                status: response.status,
+                                statusText: response.statusText,
+                                headers: responseHeaders,
+                            });
+                        }
+
+                        // Error responses: unwrap Google's array-wrapped error
+                        // bodies so standard OpenAI clients see real messages.
+                        if (!response.ok) {
+                            const text = await response
+                                .text()
+                                .catch(() => null);
+                            if (text !== null) {
+                                const unwrapped = unwrapGoogleErrorBody(text);
+                                if (unwrapped !== null) {
+                                    responseHeaders.set(
+                                        "content-type",
+                                        "application/json",
+                                    );
+                                    responseHeaders.delete("content-length");
+                                    return new Response(unwrapped, {
+                                        status: response.status,
+                                        statusText: response.statusText,
+                                        headers: responseHeaders,
+                                    });
+                                }
+                                return new Response(text, {
+                                    status: response.status,
+                                    statusText: response.statusText,
+                                    headers: responseHeaders,
+                                });
+                            }
+                            return passthrough();
+                        }
+
+                        // Non-streaming completion: harvest signatures from
+                        // the parsed body (buffered — completions are small).
+                        if (isChatCompletions) {
+                            const text = await response
+                                .text()
+                                .catch(() => null);
+                            if (text !== null) {
+                                try {
+                                    const pairs = harvestPairs(
+                                        JSON.parse(text),
+                                    );
+                                    if (pairs.length > 0) {
+                                        const cache = signatureCache(c.env);
+                                        defer(
+                                            c,
+                                            Promise.all(
+                                                pairs.map(([id, signature]) =>
+                                                    cache
+                                                        .put(id, signature)
+                                                        .catch(() => {}),
+                                                ),
+                                            ),
+                                        );
+                                    }
+                                } catch {
+                                    // not JSON — nothing to harvest
+                                }
+                                return new Response(text, {
+                                    status: response.status,
+                                    statusText: response.statusText,
+                                    headers: responseHeaders,
+                                });
+                            }
+                            return passthrough();
+                        }
+                    }
+
+                    return passthrough();
                 }
 
                 lastError = new Error(

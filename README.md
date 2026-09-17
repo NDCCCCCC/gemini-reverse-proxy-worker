@@ -47,6 +47,7 @@ This simplifies API access with load balancing, JWT validation, and seamless int
 - **Runtime Configuration**: Update API keys and base URLs at runtime without redeploying (using Cloudflare KV or D1).
 - **AI Gateway Integration**: Includes metadata headers for Cloudflare AI Gateway analytics.
 - **Error Handling**: Graceful fallback and error reporting when keys fail.
+- **OpenAI-Compatibility Healing**: Unwraps Google's array-wrapped error bodies and relays Gemini 3.x thought signatures so standard OpenAI clients can use tool calling.
 
 ## Prerequisites
 
@@ -154,7 +155,21 @@ The worker will be available at `http://localhost:8787`.
 
 ### Testing
 
-Use the provided test script to verify functionality:
+Unit tests for the thought-signature relay (no network needed):
+
+```bash
+pnpm test
+```
+
+End-to-end test against a mock upstream and a real `wrangler dev` (verifies
+error normalization, signature harvesting from both streaming and
+non-streaming responses, cache healing, and text degradation):
+
+```bash
+pnpm test:e2e
+```
+
+A manual smoke test against the live API is also available:
 
 ```bash
 npx tsx scripts/test.ts
@@ -203,6 +218,27 @@ const response = await ai.models.generateContent({
 ### Supported Endpoints
 
 All upstream API endpoints are supported.
+
+## OpenAI-Compatibility Healing
+
+Two upstream quirks of Google's `/v1beta/openai` layer are normalized so any
+standard OpenAI client (openai SDKs, pi-ai, SillyTavern, ...) works unchanged:
+
+1. **Error body unwrapping** — Google wraps error responses in an array
+   (`[{"error":{...}}]`) instead of the standard object shape, which OpenAI
+   SDKs cannot read (they report `400 status code (no body)`). The proxy
+   unwraps the array so clients see the real error message.
+
+2. **Thought-signature relay** — Gemini 3.x attaches an opaque
+   `extra_content.google.thought_signature` to every function-call turn and
+   rejects (HTTP 400) any follow-up request whose history contains a function
+   call without one. Standard clients drop that unknown field and then break
+   on their second request. The proxy harvests signatures from responses
+   (streaming SSE and non-streaming), caches them by tool-call id (KV with an
+   in-memory layer, 24h TTL), and re-injects them into follow-up requests.
+   When a signature is unknown (cache miss), the affected assistant turn is
+   degraded to plain text — which Gemini accepts without a signature — so a
+   request never fails because of a missing signature.
 
 ## Client Key Validation
 
